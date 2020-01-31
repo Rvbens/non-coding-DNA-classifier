@@ -1,0 +1,6 @@
+tmp
+capstone
+data/*
+!data/data_danq.txt
+lib/__pycache__
+.ipynb_checkpoints
