@@ -116,7 +116,7 @@ class ResTransXLHead(nn.Module):
     
 class ResTransXL(nn.Module):
     def __init__(self,vocab_size,d_emb, tsfm_cfg, n_res_blocks=3,res_k=1, res_p=0.2, 
-                 skip_cnt=False, fc_h_dim=512,lin_p=0.3, WVN=False,LSTM=True,LSTM_p=0.5):
+                 skip_cnt=False, fc_h_dim=512,lin_p=0.3, WVN=False,LSTM=False,LSTM_p=0.5):
         super(ResTransXL, self).__init__()
         self.LSTM = LSTM
         self.emb = nn.Embedding(vocab_size,d_emb)

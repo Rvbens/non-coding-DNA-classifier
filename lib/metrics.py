@@ -4,8 +4,7 @@ import concurrent.futures as cf
 #https://github.com/fastai/fastai/blob/master/fastai/metrics.py#L278
 #faster and more precise than sklearn implementation
 
-def roc_curve(input, targ):
-    "Computes the receiver operator characteristic (ROC) curve by determining the true positive ratio (TPR) and false positive ratio (FPR) for various classification thresholds. Restricted binary classification tasks."
+def roc_pr_curves(input, targ):
     targ = (targ == 1)
     desc_score_indices = input.argsort(descending=True)
     input = input.gather(-1,desc_score_indices)
@@ -20,28 +19,38 @@ def roc_curve(input, targ):
         fps = torch.cat((zer, fps))
         tps = torch.cat((zer, tps))
     fpr, tpr = fps.float() / fps[-1], tps.float() / tps[-1]
-    return fpr, tpr
+    ppv = tps.float()/(tps+fps).float()
+    ppv[0]= 0 #0/0 = nan
+    return fpr, tpr, ppv
 
-def auc_roc_score(input, targ):
-    "Computes the area under the receiver operator characteristic (ROC) curve using the trapezoid method. Restricted binary classification tasks."
-    fpr, tpr = roc_curve(input, targ)
+def auc_scores(input, targ):
+    fpr, tpr, ppv = roc_pr_curves(input, targ)
     d = fpr[1:] - fpr[:-1]
     sl1, sl2 = [slice(None)], [slice(None)]
     sl1[-1], sl2[-1] = slice(1, None), slice(None, -1)
-    return (d * (tpr[tuple(sl1)] + tpr[tuple(sl2)]) / 2.).sum(-1)
+    roc_auc = (d * (tpr[tuple(sl1)] + tpr[tuple(sl2)]) / 2.).sum(-1)
+    #plt.plot(fpr.numpy(),tpr.numpy())
+    
+    d = tpr[1:] - tpr[:-1]
+    sl1, sl2 = [slice(None)], [slice(None)]
+    sl1[-1], sl2[-1] = slice(1, None), slice(None, -1)
+    pr_auc = (d * (ppv[tuple(sl1)] + ppv[tuple(sl2)]) / 2.).sum(-1)
+    #plt.plot(tpr.numpy(),ppv.numpy())
+    return roc_auc,pr_auc
 
-def weighted_auc(inputs,targets, weights):
-    
+
+def weighted_aucs(inputs,targets, weights):
     idxs = list(range(inputs.shape[1]))
-    auc_i = lambda i: auc_roc_score(inputs[:,i],targets[:,i])
-    
+    auc_i = lambda i: auc_scores(inputs[:,i],targets[:,i])
+
     with cf.ThreadPoolExecutor() as exc:
         results = exc.map(auc_i,idxs)
-    results = list(results)
-
-    weight_aucs = torch.stack(results)*weights
+    results = torch.stack([torch.stack(i) for i in results])
+    
+    weight_aucs = results*weights[:,None]
     weight_aucs[torch.isnan(weight_aucs)] = 0
-    return weight_aucs.sum()
+    roc_auc, pr_auc =  weight_aucs.sum(0)
+    return roc_auc, pr_auc
 
 def accuracy(preds, targs):
     return ((preds>0.5)==targs).float().mean()
