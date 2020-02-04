@@ -2,5 +2,6 @@ tmp
 capstone
 data/*
 !data/data_danq.txt
+!data/img
 lib/__pycache__
 .ipynb_checkpoints

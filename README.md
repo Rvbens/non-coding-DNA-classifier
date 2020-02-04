@@ -4,6 +4,12 @@
 
 Classification of non-coding DNA sequences using a combination of deep learning architectures: WideResNet, Transformer-XL and fully connected layers with skip-connections. To learn about the implementation follow the order in the folder /notebooks and read the extensive explanation that is given in the project_report.pdf.
 
+## Grad-CAM
+
+There is also an implementation of [Grad-CAM](https://arxiv.org/abs/1610.02391) to visualize what are the important parts of the sequence to make the prediction for a choosen target in the notebook 5. Sample:
+
+![Grad-CAM](data/img/grad_cam_sample.png)
+
 ## Requirements
 
 ### Dataset
