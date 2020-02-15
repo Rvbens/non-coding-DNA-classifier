@@ -9,6 +9,7 @@ def count_parameters(model):
 class DanQ(nn.Module):
     def __init__(self):
         super().__init__()
+        self.use_amp = True
         self.emb  = nn.Embedding(4,8) # in original DanQ the input is one-hot encoded, aka not learnable
         self.conv = nn.Conv1d(8,320,26,padding=0)
         self.pool = nn.MaxPool1d(13,13)
@@ -34,7 +35,7 @@ class DanQ(nn.Module):
         x = x.view(x.shape[0],-1)         #(bs,75*640)
         x = F.relu(self.fc1(x))           #(bs,928)
         x = self.fc2(x)                   #(bs,919)
-        return x # return logits instead of sigmoid
+        return x, None # return logits instead of sigmoid
 
 
 class ConvBN(nn.Module):
@@ -78,7 +79,56 @@ class Resnet1D(nn.Module):
     def forward(self, x): return self.RBN(self.layers(x))
     
     
-class ResTransXLHead(nn.Module):
+
+class BiLSTM(nn.Module):
+    def __init__(self,d_model,p=0.5):
+        super().__init__()
+        self.use_amp = True
+        self.d_model = d_model
+        self.core = nn.LSTM(d_model, d_model, bidirectional=True,batch_first=True)
+        self.drop = nn.Dropout(p)
+    
+    def forward(self,x): 
+        last_h, _ = self.core(x)            # (bs, seq_len, num_directions * d_model)
+        last_h = last_h[:, :, :self.d_model] + last_h[:, :, self.d_model:]
+        last_h = self.drop(last_h)
+        return last_h
+
+    
+class BERT(nn.Module):
+    def __init__(self,d_model, n_layer, n_head):
+        super().__init__()
+        self.use_amp = True
+        cfg = ts.BertConfig(vocab_size=4, hidden_size=d_model, num_hidden_layers=n_layer, 
+                            num_attention_heads=n_head, intermediate_size=256)
+        
+        self.tsfm = ts.BertModel(cfg)
+        self.d_model = d_model
+        
+        self.tsfm.embeddings.word_embeddings.weight.requires_grad = False
+        self.tsfm.pooler.dense.weight.requires_grad = False
+        
+    def forward(self,x): 
+        last_h,  _ = self.tsfm(inputs_embeds=x)
+        return last_h
+        
+        
+class TransXL(nn.Module):
+    def __init__(self,d_model, n_layer, n_head, d_head, d_inner):
+        super().__init__()
+        self.use_amp = False
+        cfg = ts.TransfoXLConfig(
+            vocab_size=4, d_embed=8, d_model=d_model, n_head=d_head, d_head=d_head, 
+            d_inner=d_inner,n_layer=n_layer, tgt_len=0, ext_len=0, mem_len=256, cutoffs=[1])
+        
+        self.tsfm = ts.TransfoXLModel(cfg)
+        self.d_model = d_model
+        
+    def forward(self,x, mems=None): 
+        last_h,  mems = self.tsfm(inputs_embeds=x,mems=mems)
+        return last_h
+
+class ClsfHead(nn.Module):
     def __init__(self,inp_dim,hid_dim=512,p=0.3,WVN=False):
         super().__init__()
         layers = []
@@ -112,31 +162,29 @@ class ResTransXLHead(nn.Module):
         nn.init.constant_(self.fc_end.bias,b)
         
     def forward(self, x): return self.layers(x) 
-    
-    
-class ResTransXL(nn.Module):
-    def __init__(self,vocab_size,d_emb, tsfm_cfg, n_res_blocks=3,res_k=1, res_p=0.2, 
-                 skip_cnt=False, fc_h_dim=512,lin_p=0.3, WVN=False,LSTM=False,LSTM_p=0.5):
-        super(ResTransXL, self).__init__()
-        self.LSTM = LSTM
+
+class ResSeqLin(nn.Module):
+    def __init__(self,vocab_size,d_emb, seq_model, n_res_blocks=3, res_k=1,res_p=0.2, 
+                 skip_cnt=False, fc_h_dim=512,lin_p=0.3, WVN=False):
+        super(ResSeqLin, self).__init__()
+        # Embedding
         self.emb = nn.Embedding(vocab_size,d_emb)
-        self.res = Resnet1D(n_res_blocks,d_emb,tsfm_cfg.d_model,k=res_k)
+        #Resnet
+        self.res = Resnet1D(n_res_blocks,d_emb,seq_model.d_model,k=res_k)
         self.res_drop = nn.Dropout(res_p)
-        self.cfg = tsfm_cfg
-        if LSTM: 
-            self.core = nn.LSTM(tsfm_cfg.d_model,tsfm_cfg.d_model,bidirectional=True,batch_first=True)
-            self.core_drop = nn.Dropout(LSTM_p)
-        else: self.core = ts.TransfoXLModel(tsfm_cfg)
+        # Sequence
+        self.seq_model = seq_model 
+        # Linear
         self.skip_cnt = skip_cnt
-        self.lin_inp_dim = self.res.out_seq_len * tsfm_cfg.d_model *(1 + skip_cnt + LSTM)
-        self.lm_head = ResTransXLHead(self.lin_inp_dim,fc_h_dim,p=lin_p,WVN=False)
+        self.lin_inp_dim = self.res.out_seq_len * seq_model.d_model *(1 + skip_cnt)
+        self.lm_head = ClsfHead(self.lin_inp_dim,fc_h_dim,p=lin_p,WVN=False)
         
     def summary(self):
         print(f'Model parameters:\t\t\t\t')
-        print(f'Resnet part:\t\t{count_parameters(self.res)//1000}k')
-        print(f'Transformer-XL part:\t{count_parameters(self.core)//1000}k')
-        print(f'Linear part:\t\t{count_parameters(self.lm_head)//1000}k')
-        print(f'Total:\t\t\t{count_parameters(self)//1000}k')
+        print(f'Resnet part:\t{count_parameters(self.res)//1000}k')
+        print(f'Sequence part:\t{count_parameters(self.seq_model)//1000}k')
+        print(f'Linear part:\t{count_parameters(self.lm_head)//1000}k')
+        print(f'Total:\t\t{count_parameters(self)//1000}k')
         
     def forward(self,x,mems=None):
         x = self.emb(x)                   #(bs, 1000, d_emb)
@@ -146,15 +194,13 @@ class ResTransXL(nn.Module):
         x = self.res_drop(x)
         x = x.permute(0,2,1).contiguous() #(bs, 125, d_model)
         
-        if self.LSTM: 
-            last_h, _ = self.core(x)            # (bs, seq_len, num_directions * hidden_size)
-            last_h = self.core_drop(last_h)
-        else: last_h,  mems = self.core(inputs_embeds=x,mems=mems) #(bs, 125, d_model)
+        last_h = self.seq_model(x)             #(bs, 125, d_model)
             
         if self.skip_cnt:
             lin_inp = torch.cat([x,last_h],dim=-1)
             lin_inp = lin_inp.view(-1, self.lin_inp_dim)
         else:    
-            lin_inp = last_h.view(-1, self.lin_inp_dim)
+            lin_inp = last_h.reshape(-1, self.lin_inp_dim)
+            
         out = self.lm_head(lin_inp)
         return out, mems
