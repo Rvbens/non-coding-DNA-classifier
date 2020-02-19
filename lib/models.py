@@ -40,20 +40,26 @@ class DanQ(nn.Module):
 
 class ConvBN(nn.Module):
     # https://arxiv.org/pdf/1603.05027.pdf 
-    def __init__(self,inp_dim,out_dim,ks=1,pad=0,stride=1):
+    def __init__(self,inp_dim,out_dim,ks=1,pad=0,stride=1,p=0):
         super().__init__()
         self.bn = nn.BatchNorm1d(inp_dim)
         self.cv = nn.Conv1d(inp_dim,out_dim, kernel_size=ks, padding=pad,stride=stride,bias=False)
-    def forward(self, x): return self.cv(F.relu(self.bn(x)))
+        self.p = p
+        if p > 0: self.drop = nn.Dropout2d(p)
+            
+    def forward(self, x):
+        x = F.relu(self.bn(x))
+        if self.p > 0: x = self.drop(x)
+        return self.cv(x)
     
     
 class ResBlock1D(nn.Module):
-    def __init__(self,out_dim,first_stride=2,k=1):
+    def __init__(self,out_dim,first_stride=2,k=1,p=0):
         super().__init__()
         width = int(k * out_dim//4) # https://arxiv.org/abs/1605.07146
         self.cvbn1 = ConvBN(out_dim//2, width,stride=first_stride) #(bs,inp_dim,seq_len)
         self.cvbn2 = ConvBN(width,      width,3,1)
-        self.cvbn3 = ConvBN(width,      out_dim)
+        self.cvbn3 = ConvBN(width,      out_dim,p=p)
         self.id    = ConvBN(out_dim//2, out_dim,stride=first_stride)
         
     def forward(self,inp):
@@ -64,7 +70,7 @@ class ResBlock1D(nn.Module):
          
     
 class Resnet1D(nn.Module):
-    def __init__(self,n_blocks,emb_dim,d_model,k=1):
+    def __init__(self,n_blocks,emb_dim,d_model,k=1,p=0):
         super().__init__()
         self.out_seq_len = int(1000/2**n_blocks)
         assert d_model%2**n_blocks==0                           # n_blocks = 3
@@ -73,10 +79,11 @@ class Resnet1D(nn.Module):
 
         for i in range(n_blocks,0,-1):
             out_dim = d_model//2**(i-1)
-            layers.append(ResBlock1D(out_dim,k=k))                  # (bs, d_model//2**(i-1), seq_len/i)
+            layers.append(ResBlock1D(out_dim,k=k,p=p))                  # (bs, d_model//2**(i-1), seq_len/i)
         self.layers = nn.Sequential(*layers)
         self.RBN = nn.Sequential(nn.BatchNorm1d(d_model),nn.ReLU(inplace=True))
-    def forward(self, x): return self.RBN(self.layers(x))
+        self.res_drop = nn.Dropout(p)
+    def forward(self, x): return self.res_drop(self.RBN(self.layers(x)))
     
     
 
@@ -86,12 +93,13 @@ class BiLSTM(nn.Module):
         self.use_amp = True
         self.d_model = d_model
         self.core = nn.LSTM(d_model, d_model, bidirectional=True,batch_first=True)
+        self.ln   = nn.LayerNorm([125, d_model])
         self.drop = nn.Dropout(p)
     
     def forward(self,x): 
         last_h, _ = self.core(x)            # (bs, seq_len, num_directions * d_model)
         last_h = last_h[:, :, :self.d_model] + last_h[:, :, self.d_model:]
-        last_h = self.drop(last_h)
+        last_h = self.drop(self.ln(last_h))
         return last_h
 
     
@@ -118,11 +126,16 @@ class TransXL(nn.Module):
         super().__init__()
         self.use_amp = False
         cfg = ts.TransfoXLConfig(
-            vocab_size=4, d_embed=8, d_model=d_model, n_head=d_head, d_head=d_head, 
+            vocab_size=4, d_embed=8, d_model=d_model, n_head=n_head, d_head=d_head, 
             d_inner=d_inner,n_layer=n_layer, tgt_len=0, ext_len=0, mem_len=256, cutoffs=[1])
         
         self.tsfm = ts.TransfoXLModel(cfg)
         self.d_model = d_model
+        
+        self.tsfm.word_emb.emb_layers[0].weight.requires_grad = False
+        self.tsfm.word_emb.emb_layers[1].weight.requires_grad = False
+        self.tsfm.word_emb.emb_projs[0].requires_grad = False
+        self.tsfm.word_emb.emb_projs[1].requires_grad = False
         
     def forward(self,x, mems=None): 
         last_h,  mems = self.tsfm(inputs_embeds=x,mems=mems)
@@ -140,11 +153,10 @@ class ClsfHead(nn.Module):
                 nn.Dropout(p)
             ]
         else: hid_dim = inp_dim
-
+            
+        self.fc = nn.Sequential(*layers)
         self.fc_end = nn.Linear(hid_dim,919)
         self.init_umbalanced()
-        layers.append(self.fc_end)
-        self.layers = nn.Sequential(*layers)
         
         if WVN:
             #https://arxiv.org/pdf/1912.01857.pdf
@@ -161,46 +173,58 @@ class ClsfHead(nn.Module):
         b = -torch.log((1-pi)/pi)
         nn.init.constant_(self.fc_end.bias,b)
         
-    def forward(self, x): return self.layers(x) 
+    def forward(self, x): return self.fc_end(self.fc(x))
 
 class ResSeqLin(nn.Module):
-    def __init__(self,vocab_size,d_emb, seq_model, n_res_blocks=3, res_k=1,res_p=0.2, 
+    def __init__(self,vocab_size,d_emb, seq_model, n_res_blocks=3, res_k=1,res_p=0.3, 
                  skip_cnt=False, fc_h_dim=512,lin_p=0.3, WVN=False):
         super(ResSeqLin, self).__init__()
         # Embedding
         self.emb = nn.Embedding(vocab_size,d_emb)
+        self.emb_ln = nn.LayerNorm([1000, d_emb])
         #Resnet
-        self.res = Resnet1D(n_res_blocks,d_emb,seq_model.d_model,k=res_k)
-        self.res_drop = nn.Dropout(res_p)
+        self.res = Resnet1D(n_res_blocks,d_emb,seq_model.d_model,k=res_k,p=res_p)
         # Sequence
         self.seq_model = seq_model 
         # Linear
         self.skip_cnt = skip_cnt
         self.lin_inp_dim = self.res.out_seq_len * seq_model.d_model *(1 + skip_cnt)
-        self.lm_head = ClsfHead(self.lin_inp_dim,fc_h_dim,p=lin_p,WVN=False)
+        self.head = ClsfHead(self.lin_inp_dim,fc_h_dim,p=lin_p,WVN=False)
         
     def summary(self):
         print(f'Model parameters:\t\t\t\t')
         print(f'Resnet part:\t{count_parameters(self.res)//1000}k')
         print(f'Sequence part:\t{count_parameters(self.seq_model)//1000}k')
-        print(f'Linear part:\t{count_parameters(self.lm_head)//1000}k')
+        print(f'Linear part:\t{count_parameters(self.head)//1000}k')
         print(f'Total:\t\t{count_parameters(self)//1000}k')
         
     def forward(self,x,mems=None):
-        x = self.emb(x)                   #(bs, 1000, d_emb)
+        x = self.emb_ln(self.emb(x))      #(bs, 1000, d_emb)
         x = x.permute(0,2,1).contiguous() #(bs, d_emb, 1000)
         
         x = self.res(x)                   #(bs, d_model,125)
-        x = self.res_drop(x)
         x = x.permute(0,2,1).contiguous() #(bs, 125, d_model)
         
-        last_h = self.seq_model(x)             #(bs, 125, d_model)
+        last_h = self.seq_model(x)        #(bs, 125, d_model)
             
         if self.skip_cnt:
             lin_inp = torch.cat([x,last_h],dim=-1)
-            lin_inp = lin_inp.view(-1, self.lin_inp_dim)
+            lin_inp = lin_inp.view(-1, self.lin_inp_dim)    #(bs, 125*2*d_model)
         else:    
-            lin_inp = last_h.reshape(-1, self.lin_inp_dim)
+            lin_inp = last_h.reshape(-1, self.lin_inp_dim)  #(bs, 125*d_model)
             
-        out = self.lm_head(lin_inp)
+        out = self.head(lin_inp)                         #(bs, 919)
+        return out, mems
+        x = self.res_drop(x)
+        x = x.permute(0,2,1).contiguous() #(bs, 125, d_model)
+        
+        last_h = self.seq_model(x)        #(bs, 125, d_model)
+            
+        if self.skip_cnt:
+            lin_inp = torch.cat([x,last_h],dim=-1)
+            lin_inp = lin_inp.view(-1, self.lin_inp_dim)    #(bs, 125*2*d_model)
+        else:    
+            lin_inp = last_h.reshape(-1, self.lin_inp_dim)  #(bs, 125*d_model)
+            
+        out = self.head(lin_inp)                         #(bs, 919)
         return out, mems
