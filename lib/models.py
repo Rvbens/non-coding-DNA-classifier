@@ -54,13 +54,13 @@ class ConvBN(nn.Module):
     
     
 class ResBlock1D(nn.Module):
-    def __init__(self,out_dim,first_stride=2,k=1,p=0):
+    def __init__(self,inp_dim,out_dim,first_stride=2,k=1,p=0):
         super().__init__()
         width = int(k * out_dim//4) # https://arxiv.org/abs/1605.07146
-        self.cvbn1 = ConvBN(out_dim//2, width,stride=first_stride) #(bs,inp_dim,seq_len)
-        self.cvbn2 = ConvBN(width,      width,3,1)
-        self.cvbn3 = ConvBN(width,      out_dim,p=p)
-        self.id    = ConvBN(out_dim//2, out_dim,stride=first_stride)
+        self.cvbn1 = ConvBN(inp_dim, width,stride=first_stride) #(bs,inp_dim,seq_len)
+        self.cvbn2 = ConvBN(width,   width,3,1)
+        self.cvbn3 = ConvBN(width,   out_dim,p=p)
+        self.id    = ConvBN(inp_dim, out_dim,stride=first_stride)
         
     def forward(self,inp):
         x = self.cvbn1(inp)
@@ -70,16 +70,24 @@ class ResBlock1D(nn.Module):
          
     
 class Resnet1D(nn.Module):
-    def __init__(self,n_blocks,emb_dim,d_model,k=1,p=0):
+    def __init__(self,n_blocks,emb_dim,d_model,k=1,p=0,block_stride=None):
         super().__init__()
-        self.out_seq_len = int(1000/2**n_blocks)
-        assert d_model%2**n_blocks==0                           # n_blocks = 3
-                                                                # (bs,8,1000) input
-        layers =[nn.Conv1d(emb_dim,d_model//2**n_blocks,7,1,3,bias=False)] # (bs,64,1000)
+        if not block_stride: block_stride=[2]*n_blocks
+        n_dsmpl = (torch.tensor(block_stride)==2).sum().item()
+        assert d_model%2**n_dsmpl==0 
+        self.out_seq_len = int(1000/2**n_dsmpl)
+                                                              # n_blocks = 6
+        out_dim = d_model//2**n_dsmpl                         # (bs,emb_dim,1000) input
+        inp_dim = max(emb_dim,out_dim)
+        layers =[nn.Conv1d(emb_dim,inp_dim,7,1,3,bias=False)] # (bs,44,1000)
 
-        for i in range(n_blocks,0,-1):
-            out_dim = d_model//2**(i-1)
-            layers.append(ResBlock1D(out_dim,k=k,p=p))                  # (bs, d_model//2**(i-1), seq_len/i)
+        for i in range(n_blocks):
+            out_dim *= block_stride[i]
+            # (bs, d_model//2**(i-1), seq_len/i)
+            layers.append(ResBlock1D(inp_dim,out_dim,block_stride[i],k=k,p=p))
+            inp_dim = out_dim
+            
+        
         self.layers = nn.Sequential(*layers)
         self.RBN = nn.Sequential(nn.BatchNorm1d(d_model),nn.ReLU(inplace=True))
         self.res_drop = nn.Dropout(p)
@@ -176,14 +184,15 @@ class ClsfHead(nn.Module):
     def forward(self, x): return self.fc_end(self.fc(x))
 
 class ResSeqLin(nn.Module):
-    def __init__(self,vocab_size,d_emb, seq_model, n_res_blocks=3, res_k=1,res_p=0.3, 
+    def __init__(self,vocab_size,d_emb, seq_model, 
+                 n_res_blocks=3, res_k=1,res_p=0.3, block_stride=None,
                  skip_cnt=False, fc_h_dim=512,lin_p=0.3, WVN=False):
         super(ResSeqLin, self).__init__()
         # Embedding
         self.emb = nn.Embedding(vocab_size,d_emb)
         self.emb_ln = nn.LayerNorm([1000, d_emb])
         #Resnet
-        self.res = Resnet1D(n_res_blocks,d_emb,seq_model.d_model,k=res_k,p=res_p)
+        self.res = Resnet1D(n_res_blocks,d_emb,seq_model.d_model,k=res_k,p=res_p,block_stride=block_stride)
         # Sequence
         self.seq_model = seq_model 
         # Linear
@@ -203,19 +212,6 @@ class ResSeqLin(nn.Module):
         x = x.permute(0,2,1).contiguous() #(bs, d_emb, 1000)
         
         x = self.res(x)                   #(bs, d_model,125)
-        x = x.permute(0,2,1).contiguous() #(bs, 125, d_model)
-        
-        last_h = self.seq_model(x)        #(bs, 125, d_model)
-            
-        if self.skip_cnt:
-            lin_inp = torch.cat([x,last_h],dim=-1)
-            lin_inp = lin_inp.view(-1, self.lin_inp_dim)    #(bs, 125*2*d_model)
-        else:    
-            lin_inp = last_h.reshape(-1, self.lin_inp_dim)  #(bs, 125*d_model)
-            
-        out = self.head(lin_inp)                         #(bs, 919)
-        return out, mems
-        x = self.res_drop(x)
         x = x.permute(0,2,1).contiguous() #(bs, 125, d_model)
         
         last_h = self.seq_model(x)        #(bs, 125, d_model)
