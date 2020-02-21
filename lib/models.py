@@ -40,10 +40,10 @@ class DanQ(nn.Module):
 
 class ConvBN(nn.Module):
     # https://arxiv.org/pdf/1603.05027.pdf 
-    def __init__(self,inp_dim,out_dim,ks=1,pad=0,stride=1,p=0):
+    def __init__(self,inp_dim,out_dim,ks=1,pad=0,stride=1,p=0,C=1):
         super().__init__()
         self.bn = nn.BatchNorm1d(inp_dim)
-        self.cv = nn.Conv1d(inp_dim,out_dim, kernel_size=ks, padding=pad,stride=stride,bias=False)
+        self.cv = nn.Conv1d(inp_dim,out_dim, kernel_size=ks, padding=pad,stride=stride,bias=False,groups=C)
         self.p = p
         if p > 0: self.drop = nn.Dropout2d(p)
             
@@ -54,11 +54,21 @@ class ConvBN(nn.Module):
     
     
 class ResBlock1D(nn.Module):
-    def __init__(self,inp_dim,out_dim,first_stride=2,k=1,p=0):
+    def __init__(self,inp_dim,out_dim,first_stride=2,k=0,p=0,C=1,d=0,lvl=0):
         super().__init__()
-        width = int(k * out_dim//4) # https://arxiv.org/abs/1605.07146
+        if k>0:
+            #Wide Resnet https://arxiv.org/abs/1605.07146
+            assert d==0
+            width = int(k * out_dim//4) 
+        elif d>0:
+            # ResNext https://arxiv.org/pdf/1611.05431.pdf
+            assert k==0
+            width = C*d*2**lvl
+        else:
+            width = out_dim//4
+            
         self.cvbn1 = ConvBN(inp_dim, width,stride=first_stride) #(bs,inp_dim,seq_len)
-        self.cvbn2 = ConvBN(width,   width,3,1)
+        self.cvbn2 = ConvBN(width,   width,3,1,C=C)
         self.cvbn3 = ConvBN(width,   out_dim,p=p)
         self.id    = ConvBN(inp_dim, out_dim,stride=first_stride)
         
@@ -70,7 +80,7 @@ class ResBlock1D(nn.Module):
          
     
 class Resnet1D(nn.Module):
-    def __init__(self,n_blocks,emb_dim,d_model,k=1,p=0,block_stride=None):
+    def __init__(self,n_blocks,emb_dim,d_model,k=1,p=0,block_stride=None, C=1, d=0):
         super().__init__()
         if not block_stride: block_stride=[2]*n_blocks
         n_dsmpl = (torch.tensor(block_stride)==2).sum().item()
@@ -80,27 +90,29 @@ class Resnet1D(nn.Module):
         out_dim = d_model//2**n_dsmpl                         # (bs,emb_dim,1000) input
         inp_dim = max(emb_dim,out_dim)
         layers =[nn.Conv1d(emb_dim,inp_dim,7,1,3,bias=False)] # (bs,44,1000)
-
+        
+        lvl=0
         for i in range(n_blocks):
+            if  block_stride[i]==2: lvl+=1
             out_dim *= block_stride[i]
             # (bs, d_model//2**(i-1), seq_len/i)
-            layers.append(ResBlock1D(inp_dim,out_dim,block_stride[i],k=k,p=p))
+            layers.append(ResBlock1D(inp_dim,out_dim,block_stride[i],k=k,p=p, C=C, d=d,lvl=lvl))
             inp_dim = out_dim
-            
         
         self.layers = nn.Sequential(*layers)
         self.RBN = nn.Sequential(nn.BatchNorm1d(d_model),nn.ReLU(inplace=True))
         self.res_drop = nn.Dropout(p)
+        
     def forward(self, x): return self.res_drop(self.RBN(self.layers(x)))
     
     
 
 class BiLSTM(nn.Module):
-    def __init__(self,d_model,p=0.5):
+    def __init__(self,d_model,p=0.5, bidir=True):
         super().__init__()
         self.use_amp = True
         self.d_model = d_model
-        self.core = nn.LSTM(d_model, d_model, bidirectional=True,batch_first=True)
+        self.core = nn.LSTM(d_model, d_model, bidirectional=bidir,batch_first=True)
         self.ln   = nn.LayerNorm([125, d_model])
         self.drop = nn.Dropout(p)
     
@@ -185,14 +197,15 @@ class ClsfHead(nn.Module):
 
 class ResSeqLin(nn.Module):
     def __init__(self,vocab_size,d_emb, seq_model, 
-                 n_res_blocks=3, res_k=1,res_p=0.3, block_stride=None,
+                 n_res_blocks=3, res_k=0,res_p=0.3, block_stride=None, C=1, d=0,
                  skip_cnt=False, fc_h_dim=512,lin_p=0.3, WVN=False):
         super(ResSeqLin, self).__init__()
         # Embedding
         self.emb = nn.Embedding(vocab_size,d_emb)
         self.emb_ln = nn.LayerNorm([1000, d_emb])
         #Resnet
-        self.res = Resnet1D(n_res_blocks,d_emb,seq_model.d_model,k=res_k,p=res_p,block_stride=block_stride)
+        self.res = Resnet1D(n_res_blocks,d_emb,seq_model.d_model,k=res_k,p=res_p,
+                            block_stride=block_stride, C=C, d=d)
         # Sequence
         self.seq_model = seq_model 
         # Linear
