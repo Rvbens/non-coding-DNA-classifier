@@ -35,3 +35,9 @@ To install all the required libraries: `conda create -n new environment --file r
 ## Additional
 
 Model parameters: (Link not available yet)
+
+Tooling: the training loop are equiping with loggers to keep track of hyperparameters, basic metrics and advanced metrics as weights and gradients by layer and time:
+
+<img src="data/img/log_basic.jpg" alt="Logging: metrics" width="1000" height="500">
+<img src="data/img/log_wngrads.jpg" alt="Logging: weights and gradients" width="1000" height="500">
+<img src="data/img/log_hprams.jpg" alt="Logging: hyperparameters" width="1000" height="500">
