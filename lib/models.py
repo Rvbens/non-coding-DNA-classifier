@@ -43,7 +43,7 @@ class ConvBN(nn.Module):
     def __init__(self,inp_dim,out_dim,ks=1,pad=0,stride=1,p=0,C=1):
         super().__init__()
         self.bn = nn.BatchNorm1d(inp_dim)
-        self.cv = nn.Conv1d(inp_dim,out_dim, kernel_size=ks, padding=pad,stride=stride,bias=False,groups=C)
+        self.cv = nn.Conv1d(inp_dim,out_dim, kernel_size=ks, padding=pad,stride=stride, bias=False,groups=C)
         self.p = p
         if p > 0: self.drop = nn.Dropout2d(p)
             
@@ -51,10 +51,23 @@ class ConvBN(nn.Module):
         x = F.relu(self.bn(x))
         if self.p > 0: x = self.drop(x)
         return self.cv(x)
-    
+
+class SEblock(nn.Module):
+    # https://arxiv.org/pdf/1709.01507.pdf
+    def __init__(self,C,r=8):
+        super().__init__()
+        self.fc1 = nn.Linear(C,C//r)
+        self.fc2 = nn.Linear(C//r,C)
+        
+    def forward(self,inp):
+        x = inp.mean(dim=-1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = torch.sigmoid(x).unsqueeze(-1)
+        return x * inp
     
 class ResBlock1D(nn.Module):
-    def __init__(self,inp_dim,out_dim,first_stride=2,k=0,p=0,C=1,d=0,lvl=0):
+    def __init__(self,inp_dim,out_dim,first_stride=2,k=0,p=0,C=1,d=0,lvl=0,SE=True):
         super().__init__()
         if k>0:
             #Wide Resnet https://arxiv.org/abs/1605.07146
@@ -70,12 +83,14 @@ class ResBlock1D(nn.Module):
         self.cvbn1 = ConvBN(inp_dim, width,stride=first_stride) #(bs,inp_dim,seq_len)
         self.cvbn2 = ConvBN(width,   width,3,1,C=C)
         self.cvbn3 = ConvBN(width,   out_dim,p=p)
+        self.SE    = SEblock(out_dim) if SE else None
         self.id    = ConvBN(inp_dim, out_dim,stride=first_stride)
         
     def forward(self,inp):
         x = self.cvbn1(inp)
         x = self.cvbn2(x)
         x = self.cvbn3(x)
+        if self.SE: x = self.SE(x)
         return x + self.id(inp)
          
     
@@ -219,6 +234,7 @@ class ResSeqLin(nn.Module):
         print(f'Sequence part:\t{count_parameters(self.seq_model)//1000}k')
         print(f'Linear part:\t{count_parameters(self.head)//1000}k')
         print(f'Total:\t\t{count_parameters(self)//1000}k')
+        return str(count_parameters(self)//1e6)+'m'
         
     def forward(self,x,mems=None):
         x = self.emb_ln(self.emb(x))      #(bs, 1000, d_emb)
