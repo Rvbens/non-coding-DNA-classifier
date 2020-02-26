@@ -130,7 +130,7 @@ class Resnet1D(nn.Module):
 
 class NoRNN(nn.Module):
     #dummy model to test the effect of recurrnce part of net
-    def __init__(self,d_model=512):
+    def __init__(self,d_model):
         super().__init__()
         self.use_amp = True
         self.d_model = d_model
@@ -226,13 +226,15 @@ class ClsfHead(nn.Module):
     def forward(self, x): return self.fc_end(self.fc(x))
 
 class ResSeqLin(nn.Module):
-    def __init__(self,vocab_size,d_emb, seq_model,
+    def __init__(self,vocab_size,d_emb, seq_model, hot=False,
                  n_res_blocks=3, res_k=0,res_p=0.3, block_stride=None, C=1, d=0, bn_ks=3,
                  skip_cnt=False, fc_h_dim=512,lin_p=0.3, WVN=False):
         super(ResSeqLin, self).__init__()
         # Embedding
-        self.emb = nn.Embedding(vocab_size,d_emb)
-        self.emb_ln = nn.LayerNorm([1000, d_emb])
+        if not hot:
+            self.emb = nn.Embedding(vocab_size,d_emb)
+            self.emb_ln = nn.LayerNorm([1000, d_emb])
+        self.hot = hot
         #Resnet
         self.res = Resnet1D(n_res_blocks,d_emb,seq_model.d_model,res_k,res_p,
                             block_stride, C, d, bn_ks)
@@ -252,13 +254,14 @@ class ResSeqLin(nn.Module):
         return f'{count_parameters(self)/1e6:.2f}'+'m'
 
     def forward(self,x,mems=None):
-        x = self.emb_ln(self.emb(x))      #(bs, 1000, d_emb)
-        x = x.permute(0,2,1).contiguous() #(bs, d_emb, 1000)
+        if not self.hot:
+            x = self.emb_ln(self.emb(x))      #(bs, 1000, d_emb)
+            x = x.permute(0,2,1).contiguous() #(bs, d_emb, 1000)
 
-        x = self.res(x)                   #(bs, d_model,125)
-        x = x.permute(0,2,1).contiguous() #(bs, 125, d_model)
+        x = self.res(x)                       #(bs, d_model,125)
+        x = x.permute(0,2,1).contiguous()     #(bs, 125, d_model)
 
-        last_h = self.seq_model(x)        #(bs, 125, d_model)
+        last_h = self.seq_model(x)            #(bs, 125, d_model)
 
         if self.skip_cnt:
             lin_inp = torch.cat([x,last_h],dim=-1)
