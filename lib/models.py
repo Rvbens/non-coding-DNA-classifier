@@ -52,11 +52,12 @@ class ConvBN(nn.Module):
         super().__init__()
         self.bn = nn.BatchNorm1d(inp_dim)
         self.cv = nn.Conv1d(inp_dim,out_dim, kernel_size=ks, padding=pad, stride=stride,bias=False,groups=C)
+        self.r  = nn.ReLU(inplace=True)
         self.p = p
         if p > 0: self.drop = nn.Dropout2d(p)
 
     def forward(self, x):
-        x = F.relu(self.bn(x))
+        x = self.r(self.bn(x))
         if self.p > 0: x = self.drop(x)
         return self.cv(x)
 
@@ -66,11 +67,12 @@ class SEblock(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(C,C//r)
         self.fc2 = nn.Linear(C//r,C)
+        self.r   = nn.ReLU(inplace=True)
 
     def forward(self,inp):
         x = inp.mean(dim=-1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = self.r(self.fc1(x))
+        x = self.r(self.fc2(x))
         x = torch.sigmoid(x).unsqueeze(-1)
         return x * inp
 
