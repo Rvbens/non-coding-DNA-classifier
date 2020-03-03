@@ -4,6 +4,7 @@ __all__ = ['count_parameters', 'DanQ', 'ConvBN', 'SEblock', 'ResBlock1D', 'Resne
            'TransXL', 'ClsfHead', 'ResSeqLin']
 
 # Cell
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -110,7 +111,7 @@ class Resnet1D(nn.Module):
         if not block_stride: block_stride=[2]*n_blocks
         n_dsmpl = (torch.tensor(block_stride)==2).sum().item()
         assert d_model%2**n_dsmpl==0
-        self.out_seq_len = int(1000/2**n_dsmpl)
+        self.out_seq_len = int(np.ceil(1000/2**n_dsmpl))
                                                               # n_blocks = 6
         out_dim = d_model//2**n_dsmpl                         # (bs,emb_dim,1000) input
         inp_dim = max(emb_dim,out_dim)
@@ -140,12 +141,12 @@ class NoRNN(nn.Module):
     def forward(self,x):  return x
 
 class BiLSTM(nn.Module):
-    def __init__(self,d_model,p=0.5, bidir=True):
+    def __init__(self,d_model,seq_len,p=0.5, bidir=True):
         super().__init__()
         self.use_amp = True
         self.d_model = d_model
         self.core = nn.LSTM(d_model, d_model, bidirectional=bidir,batch_first=True)
-        self.ln   = nn.LayerNorm([125, d_model])
+        self.ln   = nn.LayerNorm([seq_len, d_model])
         self.drop = nn.Dropout(p)
 
     def forward(self,x):
@@ -236,6 +237,8 @@ class ResSeqLin(nn.Module):
         if not hot:
             self.emb = nn.Embedding(vocab_size,d_emb)
             self.emb_ln = nn.LayerNorm([1000, d_emb])
+        else:
+            assert d_emb==4
         self.hot = hot
         #Resnet
         self.res = Resnet1D(n_res_blocks,d_emb,seq_model.d_model,res_k,res_p,
